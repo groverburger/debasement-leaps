@@ -1,0 +1,6 @@
+textual>=0.60
+scipy>=1.11
+requests>=2.31
+yfinance>=0.2
+pandas>=2.0
+numpy>=1.26
