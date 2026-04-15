@@ -1,31 +1,38 @@
 """Debasement-LEAPS scanner — smooth multi-year trend edition.
 
 Two-stage pipeline:
-  1. yfinance pre-filter on a broad universe of compounders/debasement-exposed
-     names. Keeps only those with:
-       - 2-year return > +30%
-       - % of last 504 bars above 200MA >= 85%
-       - max drawdown over 504d >= -22%
-       - ATR% (14d) < 4.5% (low realized vol)
-       - within 8% of 52-week high (still in trend, not basing deep)
-  2. For survivors: pull LEAPS chains via tv_options, compute debasement
-     fair value, rank by edge (debase_fair − market_mid, in $ and %).
+  1. yfinance pre-filter on a compounder-heavy universe. Filter thresholds
+     are CLI-tunable (see --help).
+  2. For survivors: pull LEAPS chains, compute debasement fair value,
+     rank by composite edge score.
 
-Universe is biased toward multi-year smooth compounders — insurance, asset
-managers, toll-road financials, boring industrials, quality healthcare, plus
-the real-capex and hard-asset names.
+CLI:
+    python3 scan_smooth.py                             # default text output
+    python3 scan_smooth.py --top 40
+    python3 scan_smooth.py --m2 0.08 --json
+    python3 scan_smooth.py --min-above-200 80 --max-dd -25 --max-atr 5.5
+
+For a single-ticker drill-down, use inspect.py.
 """
-import sys, os, math, datetime
+from __future__ import annotations
+
+import argparse
+import json
 import pandas as pd
-import numpy as np
 import yfinance as yf
 
-sys.path.insert(0, os.path.expanduser("~/Documents/projects/darkfield"))
+from chain_analysis import (
+    analyze_ticker,
+    format_rows_table,
+    DEFAULT_M2,
+    DEFAULT_R,
+    DEFAULT_DELTA_RANGE,
+)
 from tv_options import TVOptions
-from pricing import bs_call, debase_fair_value, breakeven_annualized_growth
+
 
 # (tv_symbol, beta_to_m2, theme)
-UNIVERSE = {
+UNIVERSE: dict[str, tuple[str, float, str]] = {
     # --- Boring compounders / toll-road financials ---
     "V":    ("NYSE:V",        1.5, "payment_rail"),
     "MA":   ("NYSE:MA",       1.5, "payment_rail"),
@@ -91,25 +98,33 @@ UNIVERSE = {
     "C":    ("NYSE:C",        1.2, "money_ctr_bank"),
 }
 
-R = 0.045
-M2 = 0.07
-DTE_TARGETS = (400, 550, 700)
-DELTA_MIN = 0.40
-DELTA_MAX = 0.75
 
-
-def atr_pct(df, n=14):
+def atr_pct(df: pd.DataFrame, n: int = 14) -> float:
     h, l, c = df["High"], df["Low"], df["Close"]
     tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    return (tr.rolling(n).mean() / c).iloc[-1]
+    return float((tr.rolling(n).mean() / c).iloc[-1])
 
 
-def screen_smoothness(tickers):
-    """Pre-filter via yfinance. Returns dict ticker -> (passes, metrics)."""
-    print(f"Pre-filtering {len(tickers)} names via yfinance...")
+def screen_smoothness(
+    tickers: list[str],
+    min_ret_2y: float = 15.0,
+    min_above_200: float = 75.0,
+    max_dd: float = -28.0,
+    max_atr: float = 6.0,
+    max_dist_hi: float = 15.0,
+    verbose: bool = True,
+) -> dict[str, tuple[bool, dict]]:
+    """yfinance pre-filter for smooth multi-year trends.
+
+    Returns dict ticker -> (passes, metrics). Metrics always include a
+    `smooth_score` (higher = smoother). Falls back to (False, {reason})
+    when data unavailable.
+    """
+    if verbose:
+        print(f"Pre-filtering {len(tickers)} names via yfinance...")
     data = yf.download(tickers, period="3y", interval="1d",
                        auto_adjust=True, progress=False, group_by="ticker", threads=True)
-    results = {}
+    results: dict[str, tuple[bool, dict]] = {}
     for t in tickers:
         try:
             if isinstance(data.columns, pd.MultiIndex):
@@ -126,151 +141,153 @@ def screen_smoothness(tickers):
             ma200_504 = ma200.iloc[-504:]
             above200_pct = float((last504 > ma200_504).mean()) * 100
             rmax = last504.cummax()
-            max_dd = float((last504 / rmax - 1).min() * 100)
+            dd = float((last504 / rmax - 1).min() * 100)
             ret_504 = (last / float(last504.iloc[0]) - 1) * 100
             ret_252 = (last / float(c.iloc[-252]) - 1) * 100
             hi252 = float(df["High"].iloc[-252:].max())
             dist_hi = (hi252 - last) / last * 100
             atr = atr_pct(df, 14) * 100
             passes = (
-                ret_504 > 15 and
-                above200_pct >= 75 and
-                max_dd >= -28 and
-                atr < 6.0 and
-                dist_hi < 15.0
+                ret_504 > min_ret_2y and
+                above200_pct >= min_above_200 and
+                dd >= max_dd and
+                atr < max_atr and
+                dist_hi < max_dist_hi
             )
-            # smoothness score: higher is smoother trend
-            smooth = above200_pct + max(0, max_dd + 22) - atr * 3 + min(ret_504 / 10, 20)
+            smooth = above200_pct + max(0, dd + 22) - atr * 3 + min(ret_504 / 10, 20)
             results[t] = (passes, {
                 "last": last, "ret_504": ret_504, "ret_252": ret_252,
-                "above200_pct": above200_pct, "max_dd": max_dd,
+                "above200_pct": above200_pct, "max_dd": dd,
                 "dist_hi": dist_hi, "atr_pct": atr, "smooth_score": smooth,
             })
         except Exception as e:
-            results[t] = (False, {"reason": str(e)[:50]})
+            results[t] = (False, {"reason": str(e)[:80]})
     return results
 
 
-def analyze_chain(tv, ticker, sym, beta, spot_hint):
-    try:
-        spot = tv.get_underlying_price(sym) or spot_hint
-        if not spot or spot <= 0:
-            return []
-        exps = tv.get_expirations(sym)
-    except Exception:
-        return []
-    today = datetime.date.today()
-    today_int = int(today.strftime("%Y%m%d"))
-    future = []
-    for e in exps:
-        if e <= today_int: continue
-        try:
-            ed = datetime.date(int(str(e)[:4]), int(str(e)[4:6]), int(str(e)[6:8]))
-        except Exception: continue
-        dte = (ed - today).days
-        future.append((e, dte))
-    if not future:
-        return []
-    picks = []
-    for want in DTE_TARGETS:
-        b = min(future, key=lambda x: abs(x[1] - want))
-        if b not in picks: picks.append(b)
+def scan_smooth_universe(
+    universe: dict[str, tuple[str, float, str]],
+    m2: float = DEFAULT_M2,
+    r: float = DEFAULT_R,
+    dte_targets: tuple[int, ...] = (400, 550, 700),
+    delta_range: tuple[float, float] = DEFAULT_DELTA_RANGE,
+    screen_kwargs: dict | None = None,
+    verbose: bool = True,
+) -> tuple[list[dict], dict[str, tuple[bool, dict]]]:
+    """Full pipeline: smoothness screen + chain analysis for survivors.
 
-    mu = beta * M2
-    rows = []
-    for exp, dte in picks:
-        try: chain = tv.get_chain(sym, exp, spot=spot)
-        except Exception: continue
-        T = dte / 365.0
-        for o in chain.options:
-            if o.option_type != "call": continue
-            if not o.mid or o.mid <= 0: continue
-            if not o.iv or o.iv <= 0: continue
-            delta = o.delta or 0
-            if delta < DELTA_MIN or delta > DELTA_MAX: continue
-            K = o.strike
-            mid = o.mid
-            iv = o.iv
-            bs = bs_call(spot, K, T, R, iv, q=0)
-            df_fv = debase_fair_value(spot, K, T, R, iv, mu)
-            edge_usd = df_fv - mid
-            edge_pct = edge_usd / mid * 100 if mid > 0 else 0
-            be = breakeven_annualized_growth(spot, K, T, mid)
-            iv_penalty = max(0.3, 1.0 - max(0, iv - 0.8) * 2)
-            score = edge_pct * math.sqrt(T) * iv_penalty
-            rows.append({
-                "ticker": ticker, "theme": UNIVERSE[ticker][2],
-                "spot": spot, "beta": beta, "mu": mu,
-                "exp": exp, "dte": dte,
-                "strike": K, "ask": o.ask or 0, "bid": o.bid or 0,
-                "mid": mid, "iv": iv, "delta": delta,
-                "bs_fair": bs, "debase_fair": df_fv,
-                "edge_usd": edge_usd, "edge_pct": edge_pct, "be_g_pct": be * 100,
-                "score": score,
-            })
-    return rows
-
-
-def main():
-    tickers = list(UNIVERSE.keys())
-    screen = screen_smoothness(tickers)
+    Returns (rows, screen_results).
+    """
+    screen_kwargs = screen_kwargs or {}
+    screen = screen_smoothness(list(universe.keys()), verbose=verbose, **screen_kwargs)
     survivors = [t for t, (p, _) in screen.items() if p]
-    print(f"\n=== {len(survivors)}/{len(tickers)} passed smooth-trend filter ===")
-    print(f"{'tick':5s} {'ret2y%':>7s} {'above200%':>10s} {'maxdd%':>7s} {'atr%':>5s} {'dist_hi%':>8s} {'smooth':>7s}")
-    smooth_rank = sorted([(t, screen[t][1]) for t in survivors],
-                         key=lambda x: x[1].get("smooth_score", 0), reverse=True)
-    for t, m in smooth_rank:
-        print(f"{t:5s} {m['ret_504']:7.1f} {m['above200_pct']:10.1f} "
-              f"{m['max_dd']:7.1f} {m['atr_pct']:5.2f} {m['dist_hi']:8.2f} {m['smooth_score']:7.1f}")
+
+    if verbose:
+        print(f"\n=== {len(survivors)}/{len(universe)} passed smooth-trend filter ===")
+        print(f"{'tick':5s} {'ret2y%':>7s} {'above200%':>10s} {'maxdd%':>7s} "
+              f"{'atr%':>5s} {'dist_hi%':>8s} {'smooth':>7s}")
+        for t, m in sorted([(t, screen[t][1]) for t in survivors],
+                           key=lambda x: x[1].get("smooth_score", 0), reverse=True):
+            print(f"{t:5s} {m['ret_504']:7.1f} {m['above200_pct']:10.1f} "
+                  f"{m['max_dd']:7.1f} {m['atr_pct']:5.2f} {m['dist_hi']:8.2f} "
+                  f"{m['smooth_score']:7.1f}")
 
     tv = TVOptions()
-    all_rows = []
-    print(f"\n=== Pulling chains for survivors ===")
+    rows: list[dict] = []
+    if verbose and survivors:
+        print(f"\n=== Pulling chains for survivors ===")
     for t in survivors:
-        sym, beta, _ = UNIVERSE[t]
+        sym, beta, theme = universe[t]
         try:
-            rows = analyze_chain(tv, t, sym, beta, screen[t][1]["last"])
-            all_rows.extend(rows)
-            if rows:
-                best = max(rows, key=lambda r: r["score"])
-                print(f"{t:5s} β={beta:.1f}  n={len(rows):3d}  best: K={best['strike']:.0f} "
-                      f"DTE={best['dte']}  edge=${best['edge_usd']:5.2f} ({best['edge_pct']:+.1f}%)  "
-                      f"IV={best['iv']*100:.0f}%")
-            else:
+            r_ = analyze_ticker(symbol=sym, beta=beta, m2=m2, r=r,
+                                dte_targets=dte_targets, delta_range=delta_range, tv=tv)
+            for row in r_:
+                row["ticker"] = t
+                row["theme"] = theme
+            rows.extend(r_)
+            if verbose and r_:
+                best = max(r_, key=lambda x: x["score"])
+                print(f"{t:5s} β={beta:.1f}  n={len(r_):3d}  best: K={best['strike']:.0f} "
+                      f"DTE={best['dte']}  edge=${best['edge_usd']:+6.2f} "
+                      f"({best['edge_pct']:+.1f}%)  IV={best['iv']*100:.0f}%")
+            elif verbose:
                 print(f"{t:5s} — no eligible LEAPS strikes")
         except Exception as e:
-            print(f"{t:5s} ERR: {str(e)[:60]}")
+            if verbose:
+                print(f"{t:5s} ERR: {str(e)[:60]}")
+    return rows, screen
 
-    if not all_rows:
-        return
 
-    print(f"\n=== TOP 30 BY COMPOSITE SCORE (edge% × √T × IV-penalty) ===")
-    print(f"Columns: MID=market mid | DB=debasement fair value | EDGE$=DB-MID in $ | EDGE%=DB/MID-1")
-    hdr = (f"{'tick':5s} {'theme':16s} {'DTE':>4s} {'K':>7s} {'spot':>7s} {'ask':>6s} "
-           f"{'MID':>6s} {'DB':>6s} {'EDGE$':>6s} {'EDGE%':>6s} {'IV':>4s} {'Δ':>4s} "
-           f"{'BE%':>6s} {'score':>6s}")
-    print(hdr)
-    all_rows.sort(key=lambda r: r["score"], reverse=True)
-    for r in all_rows[:30]:
-        print(f"{r['ticker']:5s} {r['theme']:16s} {r['dte']:4d} {r['strike']:7.1f} "
-              f"{r['spot']:7.2f} {r['ask']:6.2f} {r['mid']:6.2f} {r['debase_fair']:6.2f} "
-              f"{r['edge_usd']:+6.2f} {r['edge_pct']:+6.1f} {r['iv']*100:4.0f} {r['delta']:4.2f} "
-              f"{r['be_g_pct']:+6.1f} {r['score']:6.1f}")
+def main() -> int:
+    p = argparse.ArgumentParser(description="Smooth-trend debasement-LEAPS scanner.")
+    p.add_argument("--m2", type=float, default=DEFAULT_M2)
+    p.add_argument("--rfr", type=float, default=DEFAULT_R)
+    p.add_argument("--top", type=int, default=30)
+    p.add_argument("--min-ret-2y", type=float, default=15.0,
+                   help="Minimum 2-year return %% (default 15)")
+    p.add_argument("--min-above-200", type=float, default=75.0,
+                   help="Minimum %% of last 504 days above 200MA (default 75)")
+    p.add_argument("--max-dd", type=float, default=-28.0,
+                   help="Maximum allowed max drawdown %% over 504d (default -28)")
+    p.add_argument("--max-atr", type=float, default=6.0,
+                   help="Maximum ATR%% 14d (default 6)")
+    p.add_argument("--max-dist-hi", type=float, default=15.0,
+                   help="Max %% from 52w high (default 15)")
+    p.add_argument("--delta-min", type=float, default=DEFAULT_DELTA_RANGE[0])
+    p.add_argument("--delta-max", type=float, default=DEFAULT_DELTA_RANGE[1])
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args()
 
-    print(f"\n=== BEST PICK PER TICKER (ranked by score) ===")
+    screen_kwargs = {
+        "min_ret_2y": args.min_ret_2y,
+        "min_above_200": args.min_above_200,
+        "max_dd": args.max_dd,
+        "max_atr": args.max_atr,
+        "max_dist_hi": args.max_dist_hi,
+    }
+
+    rows, screen = scan_smooth_universe(
+        universe=UNIVERSE,
+        m2=args.m2,
+        r=args.rfr,
+        delta_range=(args.delta_min, args.delta_max),
+        screen_kwargs=screen_kwargs,
+        verbose=not args.json,
+    )
+
+    if not rows:
+        if args.json:
+            print(json.dumps({"error": "no rows after filter", "count": 0, "rows": []}))
+        else:
+            print("no rows")
+        return 1
+
+    rows.sort(key=lambda r_: r_["score"], reverse=True)
+    top_rows = rows[:args.top]
     by_tick = {}
-    for r in all_rows:
-        t = r['ticker']
-        if t not in by_tick or r['score'] > by_tick[t]['score']:
-            by_tick[t] = r
-    best_list = sorted(by_tick.values(), key=lambda r: r['score'], reverse=True)
-    print(hdr)
-    for r in best_list:
-        print(f"{r['ticker']:5s} {r['theme']:16s} {r['dte']:4d} {r['strike']:7.1f} "
-              f"{r['spot']:7.2f} {r['ask']:6.2f} {r['mid']:6.2f} {r['debase_fair']:6.2f} "
-              f"{r['edge_usd']:+6.2f} {r['edge_pct']:+6.1f} {r['iv']*100:4.0f} {r['delta']:4.2f} "
-              f"{r['be_g_pct']:+6.1f} {r['score']:6.1f}")
+    for r_ in rows:
+        t = r_["ticker"]
+        if t not in by_tick or r_["score"] > by_tick[t]["score"]:
+            by_tick[t] = r_
+    best_per_tick = sorted(by_tick.values(), key=lambda r_: r_["score"], reverse=True)
+
+    if args.json:
+        print(json.dumps({
+            "m2": args.m2, "rfr": args.rfr,
+            "filter": screen_kwargs,
+            "count": len(rows),
+            "survivors": [t for t, (p, _) in screen.items() if p],
+            "top": top_rows,
+            "best_per_ticker": best_per_tick,
+        }, indent=2))
+        return 0
+
+    print(f"\n=== TOP {args.top} BY COMPOSITE SCORE ===")
+    print(format_rows_table(top_rows))
+    print(f"\n=== BEST PICK PER TICKER ===")
+    print(format_rows_table(best_per_tick))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
