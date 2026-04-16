@@ -28,6 +28,8 @@ high-β-to-M2 names, and why that's the structural source of the edge.
 | `scan_broad.py` | **CLI** — broad universe scan (crypto beta, semis, infra, commodities). |
 | `scan_smooth.py` | **CLI** — smooth-trend scan: yfinance pre-filter + LEAPS chain analysis. |
 | `debasement_leaps.py` | Textual TUI for interactive exploration (F5 to refetch). |
+| `FORECAST_SKILL.md` | **Skill doc** — how to derive the market's implied forecast from the options chain (RND via Breeden-Litzenberger, forward curve, tail-asymmetry timing). |
+| `forecast_viz.py` | **CLI** — heatmap of the market-implied forecast over time + Monte-Carlo rollout. PNG + interactive Plotly HTML. |
 
 ## CLI reference (agent-friendly)
 

@@ -235,8 +235,16 @@ def main() -> int:
                    help="Max %% from 52w high (default 15)")
     p.add_argument("--delta-min", type=float, default=DEFAULT_DELTA_RANGE[0])
     p.add_argument("--delta-max", type=float, default=DEFAULT_DELTA_RANGE[1])
+    p.add_argument("--large", action="store_true",
+                   help="Use large universe (~300 names) from universe_large.py")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
+
+    if args.large:
+        from universe_large import LARGE_UNIVERSE
+        universe = LARGE_UNIVERSE
+    else:
+        universe = UNIVERSE
 
     screen_kwargs = {
         "min_ret_2y": args.min_ret_2y,
@@ -247,7 +255,7 @@ def main() -> int:
     }
 
     rows, screen = scan_smooth_universe(
-        universe=UNIVERSE,
+        universe=universe,
         m2=args.m2,
         r=args.rfr,
         delta_range=(args.delta_min, args.delta_max),
