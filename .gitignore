@@ -10,3 +10,9 @@ __pycache__/
 scans/
 journal/
 *.private.md
+
+# generated caches and intermediate scan results (reproducible)
+*_cache.json
+*_ranking.json
+forecast_*.html
+forecast_*.png

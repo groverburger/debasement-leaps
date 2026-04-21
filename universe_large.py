@@ -181,6 +181,7 @@ LARGE_UNIVERSE: dict[str, tuple[str, float, str]] = {
     "TJX":  ("NYSE:TJX",      1.3, "consumer_moat"),
     "ROST": ("NASDAQ:ROST",   1.3, "consumer_moat"),
     "ORLY": ("NASDAQ:ORLY",   1.3, "consumer_moat"),
+    "CASY": ("NASDAQ:CASY",   2.4, "convenience_store"),
     "AZO":  ("NYSE:AZO",      1.3, "consumer_moat"),
     "ULTA": ("NASDAQ:ULTA",   1.3, "consumer_moat"),
     "MCD":  ("NYSE:MCD",      1.2, "consumer_moat"),

@@ -237,10 +237,15 @@ def main() -> int:
     p.add_argument("--delta-max", type=float, default=DEFAULT_DELTA_RANGE[1])
     p.add_argument("--large", action="store_true",
                    help="Use large universe (~300 names) from universe_large.py")
+    p.add_argument("--sp1500", action="store_true",
+                   help="Use full S&P 500+400 universe (~900 names) scraped from Wikipedia")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
-    if args.large:
+    if args.sp1500:
+        from build_universe import build_sp900
+        universe = build_sp900(verbose=not args.json)
+    elif args.large:
         from universe_large import LARGE_UNIVERSE
         universe = LARGE_UNIVERSE
     else:
