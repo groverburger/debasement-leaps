@@ -8,7 +8,8 @@ Core metric: R² of log-linear regression. This directly answers "does this
 look like a straight line on a log chart?" We compute R² across every
 available window (2y, 3y, 5y, 7y, 10y, 15y, 20y, max) and rank by:
 
-    Lindy score = avg_R² × min_R² × ln(1 + max_years_of_data)
+    Lindy score = avg_R² × min_R² × ln(1 + confirmed_years)
+    where confirmed_years = total_years × R²_of_longest_window
 
 Slope is a gate (default ≥12%), not a ranking factor. Once a stock is "fast
 enough for LEAPS," we only care how straight and how long.
@@ -137,11 +138,18 @@ def scan_lindy(
             min_r2 = min(r2s)
             max_years = max(w["years"] for w in windows.values())
 
-            # Lindy score: avg_R² × min_R² × ln(1 + years)
+            # R² of the longest available window
+            r2_longest = windows[max(windows, key=lambda k: windows[k]["years"])]["r2"]
+
+            # Quality-adjusted Lindy years: total years × R² of longest window
+            # You only get full duration credit if your full history is straight
+            confirmed_years = max_years * r2_longest
+
+            # Lindy score: avg_R² × min_R² × ln(1 + confirmed_years)
             # - avg_R²: overall straightness across all windows
             # - min_R²: penalizes ANY messy window (worst case)
-            # - ln(1+years): Lindy duration weight (logarithmic)
-            lindy_score = avg_r2 * min_r2 * math.log(1 + max_years)
+            # - confirmed_years: Lindy duration, discounted by quality
+            lindy_score = avg_r2 * min_r2 * math.log(1 + confirmed_years)
 
             tv_sym, beta, theme = universe.get(t, ("", 1.5, "unknown"))
 
@@ -155,6 +163,8 @@ def scan_lindy(
                 "n_windows": len(windows),
                 "avg_r2": round(avg_r2, 3),
                 "min_r2": round(min_r2, 3),
+                "r2_longest": round(r2_longest, 3),
+                "confirmed_years": round(confirmed_years, 1),
                 "min_ir": round(min(irs), 3),
                 "avg_ir": round(float(np.mean(irs)), 3),
                 "min_slope": round(min_sl, 1),
