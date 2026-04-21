@@ -4,12 +4,11 @@ Scans the full S&P 500 + MidCap 400 universe (~900 names) for stocks that
 look like straight lines on a log chart, weighted by how many years they've
 been doing it.
 
-Metric: Information Ratio (IR) = annualized_slope / annualized_residual_noise
-This is the Sharpe ratio of the trend — signal/noise, independent of window
-length. We compute IR across every available window (2y, 3y, 5y, 7y, 10y,
-15y, 20y, max) and rank by:
+Core metric: R² of log-linear regression. This directly answers "does this
+look like a straight line on a log chart?" We compute R² across every
+available window (2y, 3y, 5y, 7y, 10y, 15y, 20y, max) and rank by:
 
-    Lindy IR = min(IR across all windows) × ln(1 + max_years_of_data)
+    Lindy score = avg_R² × min_R² × ln(1 + max_years_of_data)
 
 Slope is a gate (default ≥12%), not a ranking factor. Once a stock is "fast
 enough for LEAPS," we only care how straight and how long.
@@ -17,8 +16,8 @@ enough for LEAPS," we only care how straight and how long.
 Pipeline:
     1. Build/load S&P 900 universe (from Wikipedia via build_universe.py)
     2. Download max daily history via yfinance
-    3. Compute IR across all windows
-    4. Gate on min_slope, rank by Lindy IR
+    3. Compute R² and slope across all windows
+    4. Gate on min_slope, rank by Lindy R² score
     5. Output top N
 
 CLI:
@@ -45,16 +44,15 @@ import yfinance as yf
 
 from build_universe import build_sp900
 
-CACHE_FILE = os.path.join(os.path.dirname(__file__), "lindy_ir_cache.json")
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "lindy_cache.json")
 WINDOWS = [("2y", 504), ("3y", 756), ("5y", 1260), ("7y", 1764),
            ("10y", 2520), ("15y", 3780), ("20y", 5040), ("max", None)]
 
 
-def compute_ir(prices: np.ndarray) -> tuple[float, float, float, float]:
-    """Compute Information Ratio for a price series.
+def compute_window(prices: np.ndarray) -> tuple[float, float, float, float]:
+    """Compute log-linear regression stats for a price series.
 
-    Returns (annualized_slope%, IR, R², annualized_noise%).
-    IR = ann_slope / ann_residual_noise — the Sharpe of the trend.
+    Returns (annualized_slope%, R², IR, annualized_noise%).
     """
     n = len(prices)
     if n < 60:
@@ -62,14 +60,14 @@ def compute_ir(prices: np.ndarray) -> tuple[float, float, float, float]:
     x = np.arange(n)
     y = np.log(prices)
     slope, intercept = np.polyfit(x, y, 1)
+    r2 = float(np.corrcoef(x, y)[0, 1] ** 2)
     predicted = slope * x + intercept
     residuals = y - predicted
     daily_resid_std = float(np.std(np.diff(residuals)))
     ann_noise = daily_resid_std * np.sqrt(252)
     ann_slope = slope * 252
     ir = ann_slope / ann_noise if ann_noise > 0 else 0.0
-    r2 = float(np.corrcoef(x, y)[0, 1] ** 2)
-    return float(ann_slope * 100), float(ir), r2, float(ann_noise * 100)
+    return float(ann_slope * 100), r2, float(ir), float(ann_noise * 100)
 
 
 def scan_lindy(
@@ -78,16 +76,16 @@ def scan_lindy(
     top_n: int = 30,
     verbose: bool = True,
 ) -> list[dict]:
-    """Run the full Lindy IR scan.
+    """Run the full Lindy R² scan.
 
     Args:
         universe: ticker → (tv_symbol, beta, theme) dict.
         min_slope: minimum annualized slope (%) across ALL windows. Gate only.
-        top_n: return this many results.
+        top_n: return this many results (0 = all).
         verbose: print progress.
 
     Returns:
-        List of result dicts sorted by lindy_ir descending.
+        List of result dicts sorted by lindy_score descending.
     """
     tickers = sorted(universe.keys())
     if verbose:
@@ -118,28 +116,33 @@ def scan_lindy(
                 actual_bars = bars if bars is not None else n
                 if n < actual_bars:
                     continue
-                sl, ir, r2, noise = compute_ir(c[-actual_bars:])
+                sl, r2, ir, noise = compute_window(c[-actual_bars:])
                 if sl > 0:
                     windows[label] = {
-                        "slope": sl, "ir": ir, "r2": r2, "noise": noise,
+                        "slope": sl, "r2": r2, "ir": ir, "noise": noise,
                         "years": actual_bars / 252,
                     }
 
             if not windows:
                 continue
 
-            irs = [w["ir"] for w in windows.values()]
             slopes = [w["slope"] for w in windows.values()]
+            r2s = [w["r2"] for w in windows.values()]
+            irs = [w["ir"] for w in windows.values()]
             min_sl = min(slopes)
             if min_sl < min_slope:
                 continue
 
-            min_ir = min(irs)
-            avg_ir = float(np.mean(irs))
+            avg_r2 = float(np.mean(r2s))
+            min_r2 = min(r2s)
             max_years = max(w["years"] for w in windows.values())
-            lindy_ir = min_ir * math.log(1 + max_years)
 
-            # Carry TV symbol and beta from universe
+            # Lindy score: avg_R² × min_R² × ln(1 + years)
+            # - avg_R²: overall straightness across all windows
+            # - min_R²: penalizes ANY messy window (worst case)
+            # - ln(1+years): Lindy duration weight (logarithmic)
+            lindy_score = avg_r2 * min_r2 * math.log(1 + max_years)
+
             tv_sym, beta, theme = universe.get(t, ("", 1.5, "unknown"))
 
             row: dict = {
@@ -150,27 +153,29 @@ def scan_lindy(
                 "last": last,
                 "total_years": round(total_years, 1),
                 "n_windows": len(windows),
-                "min_ir": round(min_ir, 3),
-                "avg_ir": round(avg_ir, 3),
+                "avg_r2": round(avg_r2, 3),
+                "min_r2": round(min_r2, 3),
+                "min_ir": round(min(irs), 3),
+                "avg_ir": round(float(np.mean(irs)), 3),
                 "min_slope": round(min_sl, 1),
                 "max_years": round(max_years, 1),
-                "lindy_ir": round(lindy_ir, 3),
+                "lindy_score": round(lindy_score, 3),
             }
             for label in ["2y", "3y", "5y", "10y", "15y", "20y", "max"]:
                 if label in windows:
-                    row[f"ir_{label}"] = round(windows[label]["ir"], 3)
-                    row[f"sl_{label}"] = round(windows[label]["slope"], 1)
                     row[f"r2_{label}"] = round(windows[label]["r2"], 3)
+                    row[f"sl_{label}"] = round(windows[label]["slope"], 1)
+                    row[f"ir_{label}"] = round(windows[label]["ir"], 3)
                 else:
-                    row[f"ir_{label}"] = None
-                    row[f"sl_{label}"] = None
                     row[f"r2_{label}"] = None
+                    row[f"sl_{label}"] = None
+                    row[f"ir_{label}"] = None
 
             results.append(row)
         except Exception:
             pass
 
-    results.sort(key=lambda x: x["lindy_ir"], reverse=True)
+    results.sort(key=lambda x: x["lindy_score"], reverse=True)
     if verbose:
         print(f"{len(results)} names passed the {min_slope}% slope gate")
     return results[:top_n] if top_n else results
@@ -179,18 +184,18 @@ def scan_lindy(
 def format_lindy_table(results: list[dict]) -> str:
     """Format results as a text table."""
     lines = []
-    hdr = (f"{'#':>3s} {'tick':6s} {'yrs':>5s} {'#w':>3s} {'lindy_ir':>8s} "
-           f"{'minIR':>5s} {'avgIR':>5s} {'ir_2y':>5s} {'ir_5y':>5s} {'ir_10y':>6s} "
-           f"{'ir_20y':>6s} {'ir_max':>6s} {'min_sl':>6s}")
+    hdr = (f"{'#':>3s} {'tick':6s} {'yrs':>5s} {'#w':>3s} {'LINDY':>7s} "
+           f"{'avgR²':>5s} {'minR²':>5s} {'R²_2y':>5s} {'R²_5y':>5s} {'R²_10y':>6s} "
+           f"{'R²_20y':>6s} {'R²_max':>6s} {'min_sl':>6s}")
     lines.append(hdr)
     for i, r in enumerate(results):
-        def fmt(v): return f"{v:5.2f}" if v is not None else "   — "
-        def fmt6(v): return f"{v:6.2f}" if v is not None else "    — "
+        def fmt(v): return f"{v:5.3f}" if v is not None else "   — "
+        def fmt6(v): return f"{v:6.3f}" if v is not None else "    — "
         lines.append(
             f"{i+1:3d} {r['ticker']:6s} {r['total_years']:5.1f} {r['n_windows']:3d} "
-            f"{r['lindy_ir']:8.3f} {r['min_ir']:5.2f} {r['avg_ir']:5.2f} "
-            f"{fmt(r.get('ir_2y'))} {fmt(r.get('ir_5y'))} {fmt6(r.get('ir_10y'))} "
-            f"{fmt6(r.get('ir_20y'))} {fmt6(r.get('ir_max'))} {r['min_slope']:+6.1f}%"
+            f"{r['lindy_score']:7.3f} {r['avg_r2']:5.3f} {r['min_r2']:5.3f} "
+            f"{fmt(r.get('r2_2y'))} {fmt(r.get('r2_5y'))} {fmt6(r.get('r2_10y'))} "
+            f"{fmt6(r.get('r2_20y'))} {fmt6(r.get('r2_max'))} {r['min_slope']:+6.1f}%"
         )
     return "\n".join(lines)
 
@@ -208,7 +213,7 @@ def main() -> int:
     p.add_argument("--refresh", action="store_true",
                    help="Re-scrape universe from Wikipedia before scanning")
     p.add_argument("--no-cache", action="store_true",
-                   help="Don't read/write the IR cache")
+                   help="Don't write the cache file")
     p.add_argument("--json", action="store_true",
                    help="Output JSON instead of text table")
     args = p.parse_args()
@@ -218,11 +223,10 @@ def main() -> int:
     results = scan_lindy(
         universe=universe,
         min_slope=args.min_slope,
-        top_n=0,  # get all, then slice
+        top_n=0,
         verbose=not args.json,
     )
 
-    # Cache full results
     if not args.no_cache:
         with open(CACHE_FILE, "w") as f:
             json.dump(results, f, indent=2)
@@ -239,8 +243,8 @@ def main() -> int:
             "results": top,
         }, indent=2))
     else:
-        print(f"\nLindy IR = min(IR) × ln(1 + years_of_data)")
-        print(f"IR = ann_slope / ann_residual_noise (Sharpe of the trend)")
+        print(f"\nLindy score = avg_R² × min_R² × ln(1 + years)")
+        print(f"R² = how much does this look like a straight line on a log chart")
         print(f"Gate: min slope ≥ {args.min_slope}% across ALL windows\n")
         print(format_lindy_table(top))
 
