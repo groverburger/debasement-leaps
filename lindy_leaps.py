@@ -62,12 +62,12 @@ def load_lindy_results() -> list[dict]:
 
 
 def compute_trend_deviation(ticker: str) -> dict | None:
-    """Compute where spot sits relative to the 5yr log-linear regression.
+    """Compute where spot sits relative to the max-history log-linear regression.
 
-    Returns dict with slope, intercept, r2, trend_today, and n_bars
-    (needed to project the regression line forward).
+    Uses period="max" to match the Lindy scan's methodology — the regression
+    is fit on the full available history, same data the Lindy score is based on.
     """
-    data = yf.download(ticker, period="5y", interval="1d",
+    data = yf.download(ticker, period="max", interval="1d",
                        auto_adjust=True, progress=False)
     if data.empty or len(data) < 504:
         return None

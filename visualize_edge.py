@@ -75,22 +75,19 @@ def plot_edge(symbol: str, r: float = 0.045,
     """Generate the channel + cone edge visualization."""
     ticker = symbol.split(":")[-1] if ":" in symbol else symbol
 
-    # Pull max history for Lindy years, 5yr for regression
-    hist_max = yf.download(ticker, period="max", interval="1d",
+    # Pull max history — regression uses full history (same as Lindy scan)
+    hist_all = yf.download(ticker, period="max", interval="1d",
                            auto_adjust=True, progress=False)
-    hist_5y = yf.download(ticker, period="5y", interval="1d",
-                          auto_adjust=True, progress=False)
-    if hist_5y.empty or len(hist_5y) < 504:
+    if hist_all.empty or len(hist_all) < 504:
         print(f"Insufficient data for {ticker}")
         return
 
-    total_years = len(hist_max) / 252 if not hist_max.empty else 0
-
-    all_dates = hist_5y.index
-    all_prices = hist_5y["Close"].values.flatten()
+    all_dates = hist_all.index
+    all_prices = hist_all["Close"].values.flatten()
     n = len(all_prices)
+    total_years = n / 252
 
-    # Fit regression on 5yr history
+    # Fit regression on FULL history (matching Lindy scan methodology)
     x_all = np.arange(n)
     y_all = np.log(all_prices)
     slope_daily, intercept = np.polyfit(x_all, y_all, 1)
