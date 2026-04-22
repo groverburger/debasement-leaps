@@ -1,20 +1,21 @@
-"""Visualize the LEAPS edge: two cones + trend line.
+"""Visualize the LEAPS edge: Lindy channel vs IV cone.
 
-Shows two uncertainty cones:
-  1. RED cone (IV): the market's risk-neutral distribution, centered on
-     spot × e^(rT), spread = IV. What the options market prices.
-  2. GREEN cone (Lindy): the regression's prediction interval, centered on
-     the trend line, spread from residual std (driven by R²). What the
-     Lindy model predicts, with uncertainty.
+Shows two distinct shapes:
+  1. GREEN CHANNEL (constant width): the regression band the stock
+     oscillates within. Width from residual std (driven by R²). Doesn't
+     widen over time because high R² = mean-reverting deviations.
+     Shown through history AND projected forward.
+  2. RED CONE (widening): the market's risk-neutral distribution.
+     Widens with √T because the market models returns as a random walk.
 
-The non-overlapping region between the cones IS the edge, visually.
-High R² → tight green cone → high confidence. Low IV → tight red cone →
-cheap to capture. Both tight + far apart = maximum edge.
+The channel has a DIFFERENT SHAPE than the cone — parallel lines vs
+a wedge — so they're visually distinct and easy to parse.
+
+The edge is visible where the green channel sits above the red cone.
 
 CLI:
     python3 visualize_edge.py NYSE:TJX
     python3 visualize_edge.py NYSE:COR --save cor_edge.png
-    python3 visualize_edge.py NASDAQ:CASY --interactive
 """
 from __future__ import annotations
 
@@ -71,7 +72,7 @@ def get_best_leaps(tv: TVOptions, symbol: str, spot: float):
 
 def plot_edge(symbol: str, r: float = 0.045,
               save_path: str | None = None, interactive: bool = False):
-    """Generate the two-cone edge visualization."""
+    """Generate the channel + cone edge visualization."""
     ticker = symbol.split(":")[-1] if ":" in symbol else symbol
 
     # Pull max history for Lindy years, 5yr for regression
@@ -96,11 +97,10 @@ def plot_edge(symbol: str, r: float = 0.045,
     ann_slope = slope_daily * 252
     r2 = float(np.corrcoef(x_all, y_all)[0, 1] ** 2)
 
-    # Residual std (drives the Lindy cone width)
+    # Residual std — the LEVEL of deviation from trend (constant, not growing)
     predicted = intercept + slope_daily * x_all
     residuals = y_all - predicted
-    resid_std_daily = float(np.std(np.diff(residuals)))
-    resid_std_ann = resid_std_daily * np.sqrt(252)
+    resid_std = float(np.std(residuals))  # in log-price space, constant band
 
     # Get options data
     tv = TVOptions()
@@ -120,14 +120,14 @@ def plot_edge(symbol: str, r: float = 0.045,
     iv = leaps["iv"]
     dte = leaps["dte"]
     drift_in_sigma = (ann_slope - r) * math.sqrt(dte / 365) / iv
+    channel_pct = (math.exp(resid_std) - 1) * 100  # ±1σ as a percentage
 
     print(f"{ticker}: spot=${spot:.2f}, trend=${trend_today:.2f} "
           f"({deviation:+.1f}% vs trend)")
     print(f"  slope={ann_slope*100:.1f}%/yr, R²={r2:.3f}, "
-          f"Lindy={total_years:.0f}yr, resid_σ={resid_std_ann*100:.1f}%/yr")
+          f"Lindy={total_years:.0f}yr, channel=±{channel_pct:.0f}%")
     print(f"  LEAPS: K={leaps['strike']:.0f}, DTE={dte}, "
-          f"IV={iv*100:.0f}%, Δ={leaps['delta']:.2f}, "
-          f"drift={drift_in_sigma:.2f}σ above risk-neutral")
+          f"IV={iv*100:.0f}%, drift={drift_in_sigma:.2f}σ")
 
     # --- Build the plot ---
     fig, ax = plt.subplots(1, 1, figsize=(14, 8))
@@ -137,65 +137,51 @@ def plot_edge(symbol: str, r: float = 0.045,
     one_year_bars = min(252, n)
     hist_dates = all_dates[-one_year_bars:]
     hist_prices = all_prices[-one_year_bars:]
-    ax.plot(hist_dates, hist_prices, color="#2196F3", linewidth=1.5,
-            label="Price", zorder=3)
 
-    # --- Continuous regression line: history + forward ---
     today_dt = all_dates[-1]
     exp_date = leaps["exp_date"]
-
-    # History portion
-    x_hist_vis = np.arange(n - one_year_bars, n)
-    trend_hist = np.exp(intercept + slope_daily * x_hist_vis)
-    ax.plot(hist_dates, trend_hist, color="#4CAF50", linewidth=2,
-            alpha=0.6, zorder=2)
-
-    # Forward portion
-    x_forward = np.arange(n, n + dte + 1)
-    trend_forward = np.exp(intercept + slope_daily * x_forward)
     cal_days_per_td = 365 / 252
+
+    # Full x-range for the channel: history + forward
+    x_hist_vis = np.arange(n - one_year_bars, n)
+    x_forward = np.arange(n, n + dte + 1)
+    x_full = np.concatenate([x_hist_vis, x_forward])
+
+    # Dates for the full range
     forward_cal_dates = [today_dt + datetime.timedelta(days=int(i * cal_days_per_td))
                          for i in range(len(x_forward))]
+    full_dates = list(hist_dates) + forward_cal_dates
+
+    # --- GREEN CHANNEL: constant-width band around regression ---
+    trend_full = np.exp(intercept + slope_daily * x_full)
+    chan_1u = trend_full * math.exp(+1 * resid_std)
+    chan_1d = trend_full * math.exp(-1 * resid_std)
+    chan_2u = trend_full * math.exp(+2 * resid_std)
+    chan_2d = trend_full * math.exp(-2 * resid_std)
+
+    ax.fill_between(full_dates, chan_2d, chan_2u,
+                     color="#4CAF50", alpha=0.07,
+                     label=f"Lindy ±2σ channel (±{channel_pct*2:.0f}%)")
+    ax.fill_between(full_dates, chan_1d, chan_1u,
+                     color="#4CAF50", alpha=0.13,
+                     label=f"Lindy ±1σ channel (±{channel_pct:.0f}%)")
+
+    # Trend center line through history (solid) and forward (dashed)
+    trend_hist = np.exp(intercept + slope_daily * x_hist_vis)
+    trend_fwd = np.exp(intercept + slope_daily * x_forward)
+    ax.plot(hist_dates, trend_hist, color="#4CAF50", linewidth=2, alpha=0.7, zorder=2)
+    ax.plot(forward_cal_dates, trend_fwd, color="#4CAF50", linewidth=2.5,
+            linestyle="--", zorder=4,
+            label=f"Lindy trend ({ann_slope*100:.1f}%/yr, R²={r2:.2f})")
+
+    # Price data ON TOP of the channel — so you can see it bouncing inside
+    ax.plot(hist_dates, hist_prices, color="#2196F3", linewidth=1.8,
+            label="Price", zorder=5)
+
+    # --- RED CONE: IV distribution (widening, from spot) ---
     forward_t = np.array([i / 252 for i in range(len(x_forward))])
-
-    ax.plot(forward_cal_dates, trend_forward, color="#4CAF50", linewidth=2.5,
-            linestyle="--",
-            label=f"Lindy trend ({ann_slope*100:.1f}%/yr, R²={r2:.2f})",
-            zorder=4)
-
-    # --- GREEN CONE: Lindy prediction interval (R²-driven) ---
-    # Width comes from regression residual std, growing with sqrt(forward time)
-    lindy_sigma_t = resid_std_ann * np.sqrt(forward_t)
-    lindy_center = trend_forward  # centered on the regression line
-    lindy_1u = lindy_center * np.exp(+1 * lindy_sigma_t)
-    lindy_1d = lindy_center * np.exp(-1 * lindy_sigma_t)
-    lindy_2u = lindy_center * np.exp(+2 * lindy_sigma_t)
-    lindy_2d = lindy_center * np.exp(-2 * lindy_sigma_t)
-
-    ax.fill_between(forward_cal_dates, lindy_2d, lindy_2u,
-                     color="#4CAF50", alpha=0.06,
-                     label=f"Lindy ±2σ (R²={r2:.2f}, resid {resid_std_ann*100:.0f}%)")
-    ax.fill_between(forward_cal_dates, lindy_1d, lindy_1u,
-                     color="#4CAF50", alpha=0.12,
-                     label=f"Lindy ±1σ")
-
-    # --- Mark spot deviation ---
-    ax.plot(today_dt, spot, "o", color="#2196F3", markersize=8, zorder=5)
-    ax.plot(today_dt, trend_today, "o", color="#4CAF50", markersize=8, zorder=5)
-    if abs(deviation) > 2:
-        ax.annotate(f"  spot {deviation:+.1f}%\n  vs trend",
-                    xy=(today_dt, spot), fontsize=9, color="#2196F3",
-                    ha="left", va="bottom" if deviation > 0 else "top",
-                    fontweight="bold")
-
-    # --- Risk-neutral forward (from spot) ---
     rf_forward = spot * np.exp(r * forward_t)
-    ax.plot(forward_cal_dates, rf_forward, color="#FF5722", linewidth=2,
-            linestyle=":",
-            label=f"Risk-neutral ({r*100:.1f}%/yr)",
-            zorder=4)
 
-    # --- RED CONE: IV distribution (market's view) ---
     iv_sigma_t = iv * np.sqrt(forward_t)
     iv_1u = rf_forward * np.exp(+1 * iv_sigma_t)
     iv_1d = rf_forward * np.exp(-1 * iv_sigma_t)
@@ -203,18 +189,33 @@ def plot_edge(symbol: str, r: float = 0.045,
     iv_2d = rf_forward * np.exp(-2 * iv_sigma_t)
 
     ax.fill_between(forward_cal_dates, iv_2d, iv_2u,
-                     color="#FF5722", alpha=0.06,
-                     label=f"IV ±2σ ({iv*100:.0f}% vol)")
+                     color="#FF5722", alpha=0.07,
+                     label=f"IV ±2σ cone ({iv*100:.0f}% vol)")
     ax.fill_between(forward_cal_dates, iv_1d, iv_1u,
-                     color="#FF5722", alpha=0.12,
-                     label=f"IV ±1σ")
+                     color="#FF5722", alpha=0.13,
+                     label=f"IV ±1σ cone")
+
+    ax.plot(forward_cal_dates, rf_forward, color="#FF5722", linewidth=2,
+            linestyle=":", zorder=4,
+            label=f"Risk-neutral ({r*100:.1f}%/yr)")
+
+    # --- Mark spot deviation ---
+    ax.plot(today_dt, spot, "o", color="#2196F3", markersize=8, zorder=6)
+    ax.plot(today_dt, trend_today, "o", color="#4CAF50", markersize=6, zorder=6)
+    if abs(deviation) > 2:
+        ax.annotate(f"spot {deviation:+.1f}%\nvs trend",
+                    xy=(today_dt, spot), fontsize=9, color="#2196F3",
+                    ha="right", va="bottom" if deviation > 0 else "top",
+                    fontweight="bold",
+                    xytext=(-10, 10 if deviation > 0 else -10),
+                    textcoords="offset points")
 
     # --- Strike ---
     ax.axhline(y=leaps["strike"], color="#9C27B0", linewidth=1, linestyle="-.",
-               alpha=0.5, label=f"Strike ${leaps['strike']:.0f}")
+               alpha=0.4, label=f"Strike ${leaps['strike']:.0f}")
 
     # --- Edge annotation at expiry ---
-    trend_at_exp = float(trend_forward[-1])
+    trend_at_exp = float(trend_fwd[-1])
     rf_at_exp = float(rf_forward[-1])
     edge_pct = (trend_at_exp / rf_at_exp - 1) * 100
 
@@ -223,33 +224,31 @@ def plot_edge(symbol: str, r: float = 0.045,
                 xy=(forward_cal_dates[-1], trend_at_exp),
                 xytext=(forward_cal_dates[-1], rf_at_exp),
                 arrowprops=dict(arrowstyle="<->", color="#E91E63", lw=2.5))
-    ax.annotate(f"  EDGE: {edge_pct:.0f}%\n  drift = {drift_in_sigma:.1f}σ",
+    ax.annotate(f"  EDGE: {edge_pct:.0f}%\n  {drift_in_sigma:.1f}σ drift",
                 xy=(forward_cal_dates[-1], mid_y),
                 fontsize=11, fontweight="bold", color="#E91E63",
                 ha="left", va="center")
 
-    # --- Title with Lindy years ---
-    title_line1 = f"{ticker} — LEAPS Edge: Two Cones"
-    title_line2 = (f"Slope={ann_slope*100:.1f}%/yr  R²={r2:.3f}  "
-                   f"Lindy={total_years:.0f}yr  "
-                   f"IV={iv*100:.0f}%  DTE={dte}  K=${leaps['strike']:.0f}")
+    # --- Title ---
+    title = f"{ticker} — LEAPS Edge: Channel vs Cone"
+    subtitle = (f"Slope={ann_slope*100:.1f}%/yr  R²={r2:.3f}  "
+                f"Lindy={total_years:.0f}yr  "
+                f"IV={iv*100:.0f}%  DTE={dte}  K=${leaps['strike']:.0f}")
     if abs(deviation) > 1:
-        title_line2 += f"  Spot {deviation:+.1f}% vs trend"
-    ax.set_title(f"{title_line1}\n{title_line2}",
-                 fontsize=13, fontweight="bold")
+        subtitle += f"  Spot {deviation:+.1f}%"
+    ax.set_title(f"{title}\n{subtitle}", fontsize=13, fontweight="bold")
 
-    # --- Info box with key metrics ---
-    info_text = (
-        f"Lindy: {total_years:.0f}yr history, {ann_slope*100:.1f}%/yr, R²={r2:.3f}\n"
-        f"Green cone: resid σ = {resid_std_ann*100:.0f}%/yr (from R²)\n"
-        f"Red cone: IV = {iv*100:.0f}%/yr (from options market)\n"
-        f"Drift = {drift_in_sigma:.2f}σ above risk-neutral"
+    # --- Info box ---
+    info = (
+        f"Green channel: ±{channel_pct:.0f}% around trend (constant, mean-reverting)\n"
+        f"Red cone: IV={iv*100:.0f}% (widens with √T, random-walk model)\n"
+        f"Drift = {drift_in_sigma:.2f}σ above risk-neutral at expiry"
     )
-    ax.text(0.98, 0.02, info_text, transform=ax.transAxes,
+    ax.text(0.98, 0.02, info, transform=ax.transAxes,
             fontsize=9, fontfamily="monospace",
             verticalalignment="bottom", horizontalalignment="right",
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
-                      edgecolor="gray", alpha=0.85))
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                      edgecolor="gray", alpha=0.9))
 
     # --- Formatting ---
     ax.set_xlabel("Date")
@@ -276,7 +275,7 @@ def plot_edge(symbol: str, r: float = 0.045,
     return {
         "ticker": ticker, "spot": spot, "trend_today": trend_today,
         "deviation_pct": deviation, "slope": ann_slope, "r2": r2,
-        "resid_std_ann": resid_std_ann,
+        "resid_std": resid_std, "channel_pct": channel_pct,
         "iv": iv, "drift_in_sigma": drift_in_sigma,
         "trend_at_exp": trend_at_exp, "rf_at_exp": rf_at_exp,
         "edge_pct": edge_pct, "total_years": total_years,
@@ -285,22 +284,18 @@ def plot_edge(symbol: str, r: float = 0.045,
 
 def main():
     p = argparse.ArgumentParser(
-        description="Visualize the LEAPS edge: Lindy cone vs IV cone.",
+        description="Visualize the LEAPS edge: Lindy channel vs IV cone.",
         epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("symbol", help="TradingView symbol, e.g. NYSE:TJX")
     p.add_argument("--rfr", type=float, default=0.045)
-    p.add_argument("--save", type=str, default=None, help="Output filename")
-    p.add_argument("--interactive", action="store_true", help="Show plot window")
+    p.add_argument("--save", type=str, default=None)
+    p.add_argument("--interactive", action="store_true")
     args = p.parse_args()
 
-    plot_edge(
-        symbol=args.symbol,
-        r=args.rfr,
-        save_path=args.save,
-        interactive=args.interactive,
-    )
+    plot_edge(symbol=args.symbol, r=args.rfr,
+              save_path=args.save, interactive=args.interactive)
 
 
 if __name__ == "__main__":
