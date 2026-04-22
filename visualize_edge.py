@@ -1,21 +1,20 @@
-"""Visualize the LEAPS edge: historical trend vs IV uncertainty cone.
+"""Visualize the LEAPS edge: two cones + trend line.
 
-For a given symbol, plots:
-  1. Past year of daily price data (log scale)
-  2. ONE continuous regression line through history AND projected forward
-     (the Lindy trend — where the stock "should be" if the trend holds)
-  3. Spot's deviation from the trend line (overextended / underextended)
-  4. The IV cone: ±1σ and ±2σ from the risk-neutral forward
-  5. The gap between the trend line at expiry and the IV cone center = the edge
+Shows two uncertainty cones:
+  1. RED cone (IV): the market's risk-neutral distribution, centered on
+     spot × e^(rT), spread = IV. What the options market prices.
+  2. GREEN cone (Lindy): the regression's prediction interval, centered on
+     the trend line, spread from residual std (driven by R²). What the
+     Lindy model predicts, with uncertainty.
 
-The visual makes the thesis intuitive: the stock has been climbing along a
-straight line for years, but options are priced as if it will grow at 4.5%/yr.
-The divergence between the trend line and the cone center is the unpriced drift.
+The non-overlapping region between the cones IS the edge, visually.
+High R² → tight green cone → high confidence. Low IV → tight red cone →
+cheap to capture. Both tight + far apart = maximum edge.
 
 CLI:
     python3 visualize_edge.py NYSE:TJX
-    python3 visualize_edge.py NASDAQ:FAST --save fast_edge.png
-    python3 visualize_edge.py NYSE:COR --interactive
+    python3 visualize_edge.py NYSE:COR --save cor_edge.png
+    python3 visualize_edge.py NASDAQ:CASY --interactive
 """
 from __future__ import annotations
 
@@ -72,26 +71,36 @@ def get_best_leaps(tv: TVOptions, symbol: str, spot: float):
 
 def plot_edge(symbol: str, r: float = 0.045,
               save_path: str | None = None, interactive: bool = False):
-    """Generate the edge visualization."""
+    """Generate the two-cone edge visualization."""
     ticker = symbol.split(":")[-1] if ":" in symbol else symbol
 
-    # Get price history — 5 years for regression, show last year
-    hist = yf.download(ticker, period="5y", interval="1d",
-                       auto_adjust=True, progress=False)
-    if hist.empty or len(hist) < 504:
+    # Pull max history for Lindy years, 5yr for regression
+    hist_max = yf.download(ticker, period="max", interval="1d",
+                           auto_adjust=True, progress=False)
+    hist_5y = yf.download(ticker, period="5y", interval="1d",
+                          auto_adjust=True, progress=False)
+    if hist_5y.empty or len(hist_5y) < 504:
         print(f"Insufficient data for {ticker}")
         return
 
-    all_dates = hist.index
-    all_prices = hist["Close"].values.flatten()
+    total_years = len(hist_max) / 252 if not hist_max.empty else 0
+
+    all_dates = hist_5y.index
+    all_prices = hist_5y["Close"].values.flatten()
     n = len(all_prices)
 
-    # Fit ONE regression on the full 5yr history
+    # Fit regression on 5yr history
     x_all = np.arange(n)
     y_all = np.log(all_prices)
     slope_daily, intercept = np.polyfit(x_all, y_all, 1)
     ann_slope = slope_daily * 252
     r2 = float(np.corrcoef(x_all, y_all)[0, 1] ** 2)
+
+    # Residual std (drives the Lindy cone width)
+    predicted = intercept + slope_daily * x_all
+    residuals = y_all - predicted
+    resid_std_daily = float(np.std(np.diff(residuals)))
+    resid_std_ann = resid_std_daily * np.sqrt(252)
 
     # Get options data
     tv = TVOptions()
@@ -105,16 +114,20 @@ def plot_edge(symbol: str, r: float = 0.045,
         print(f"No eligible LEAPS for {symbol}")
         return
 
-    # Where the trend line says the stock "should be" today
     trend_today = math.exp(intercept + slope_daily * (n - 1))
     deviation = (spot / trend_today - 1) * 100
-    dev_label = "above" if deviation > 0 else "below"
+
+    iv = leaps["iv"]
+    dte = leaps["dte"]
+    drift_in_sigma = (ann_slope - r) * math.sqrt(dte / 365) / iv
 
     print(f"{ticker}: spot=${spot:.2f}, trend=${trend_today:.2f} "
-          f"({deviation:+.1f}% {dev_label} trend)")
-    print(f"  slope={ann_slope*100:.1f}%/yr, R²={r2:.3f}")
-    print(f"  LEAPS: K={leaps['strike']:.0f}, DTE={leaps['dte']}, "
-          f"IV={leaps['iv']*100:.0f}%, Δ={leaps['delta']:.2f}, ask=${leaps['ask']:.2f}")
+          f"({deviation:+.1f}% vs trend)")
+    print(f"  slope={ann_slope*100:.1f}%/yr, R²={r2:.3f}, "
+          f"Lindy={total_years:.0f}yr, resid_σ={resid_std_ann*100:.1f}%/yr")
+    print(f"  LEAPS: K={leaps['strike']:.0f}, DTE={dte}, "
+          f"IV={iv*100:.0f}%, Δ={leaps['delta']:.2f}, "
+          f"drift={drift_in_sigma:.2f}σ above risk-neutral")
 
     # --- Build the plot ---
     fig, ax = plt.subplots(1, 1, figsize=(14, 8))
@@ -127,33 +140,46 @@ def plot_edge(symbol: str, r: float = 0.045,
     ax.plot(hist_dates, hist_prices, color="#2196F3", linewidth=1.5,
             label="Price", zorder=3)
 
-    # --- ONE continuous regression line: history + forward ---
+    # --- Continuous regression line: history + forward ---
     today_dt = all_dates[-1]
     exp_date = leaps["exp_date"]
-    dte = leaps["dte"]
 
-    # Regression line through visible history
+    # History portion
     x_hist_vis = np.arange(n - one_year_bars, n)
     trend_hist = np.exp(intercept + slope_daily * x_hist_vis)
     ax.plot(hist_dates, trend_hist, color="#4CAF50", linewidth=2,
             alpha=0.6, zorder=2)
 
-    # Same regression line projected forward (continuous from the same fit)
+    # Forward portion
     x_forward = np.arange(n, n + dte + 1)
     trend_forward = np.exp(intercept + slope_daily * x_forward)
-    forward_dates = [today_dt + datetime.timedelta(days=int(i * 365 / 252))
-                     for i in range(dte + 1)]
-    # Approximate: map trading days to calendar days
-    cal_days_per_trade_day = 365 / 252
-    forward_cal_dates = [today_dt + datetime.timedelta(days=int(i * cal_days_per_trade_day))
+    cal_days_per_td = 365 / 252
+    forward_cal_dates = [today_dt + datetime.timedelta(days=int(i * cal_days_per_td))
                          for i in range(len(x_forward))]
+    forward_t = np.array([i / 252 for i in range(len(x_forward))])
 
     ax.plot(forward_cal_dates, trend_forward, color="#4CAF50", linewidth=2.5,
             linestyle="--",
             label=f"Lindy trend ({ann_slope*100:.1f}%/yr, R²={r2:.2f})",
             zorder=4)
 
-    # Mark spot's deviation from trend
+    # --- GREEN CONE: Lindy prediction interval (R²-driven) ---
+    # Width comes from regression residual std, growing with sqrt(forward time)
+    lindy_sigma_t = resid_std_ann * np.sqrt(forward_t)
+    lindy_center = trend_forward  # centered on the regression line
+    lindy_1u = lindy_center * np.exp(+1 * lindy_sigma_t)
+    lindy_1d = lindy_center * np.exp(-1 * lindy_sigma_t)
+    lindy_2u = lindy_center * np.exp(+2 * lindy_sigma_t)
+    lindy_2d = lindy_center * np.exp(-2 * lindy_sigma_t)
+
+    ax.fill_between(forward_cal_dates, lindy_2d, lindy_2u,
+                     color="#4CAF50", alpha=0.06,
+                     label=f"Lindy ±2σ (R²={r2:.2f}, resid {resid_std_ann*100:.0f}%)")
+    ax.fill_between(forward_cal_dates, lindy_1d, lindy_1u,
+                     color="#4CAF50", alpha=0.12,
+                     label=f"Lindy ±1σ")
+
+    # --- Mark spot deviation ---
     ax.plot(today_dt, spot, "o", color="#2196F3", markersize=8, zorder=5)
     ax.plot(today_dt, trend_today, "o", color="#4CAF50", markersize=8, zorder=5)
     if abs(deviation) > 2:
@@ -162,26 +188,26 @@ def plot_edge(symbol: str, r: float = 0.045,
                     ha="left", va="bottom" if deviation > 0 else "top",
                     fontweight="bold")
 
-    # --- Risk-neutral forward (from SPOT, not from trend) ---
-    forward_t = np.array([i / 252 for i in range(len(x_forward))])
+    # --- Risk-neutral forward (from spot) ---
     rf_forward = spot * np.exp(r * forward_t)
     ax.plot(forward_cal_dates, rf_forward, color="#FF5722", linewidth=2,
             linestyle=":",
-            label=f"Risk-neutral ({r*100:.1f}%/yr — what options price)",
+            label=f"Risk-neutral ({r*100:.1f}%/yr)",
             zorder=4)
 
-    # --- IV cone (±1σ, ±2σ) from risk-neutral ---
-    iv = leaps["iv"]
-    sigma_t = iv * np.sqrt(forward_t)
-    cone_1u = rf_forward * np.exp(+1 * sigma_t)
-    cone_1d = rf_forward * np.exp(-1 * sigma_t)
-    cone_2u = rf_forward * np.exp(+2 * sigma_t)
-    cone_2d = rf_forward * np.exp(-2 * sigma_t)
+    # --- RED CONE: IV distribution (market's view) ---
+    iv_sigma_t = iv * np.sqrt(forward_t)
+    iv_1u = rf_forward * np.exp(+1 * iv_sigma_t)
+    iv_1d = rf_forward * np.exp(-1 * iv_sigma_t)
+    iv_2u = rf_forward * np.exp(+2 * iv_sigma_t)
+    iv_2d = rf_forward * np.exp(-2 * iv_sigma_t)
 
-    ax.fill_between(forward_cal_dates, cone_2d, cone_2u,
-                     color="#FF5722", alpha=0.08, label=f"IV ±2σ ({iv*100:.0f}% vol)")
-    ax.fill_between(forward_cal_dates, cone_1d, cone_1u,
-                     color="#FF5722", alpha=0.15, label=f"IV ±1σ")
+    ax.fill_between(forward_cal_dates, iv_2d, iv_2u,
+                     color="#FF5722", alpha=0.06,
+                     label=f"IV ±2σ ({iv*100:.0f}% vol)")
+    ax.fill_between(forward_cal_dates, iv_1d, iv_1u,
+                     color="#FF5722", alpha=0.12,
+                     label=f"IV ±1σ")
 
     # --- Strike ---
     ax.axhline(y=leaps["strike"], color="#9C27B0", linewidth=1, linestyle="-.",
@@ -197,21 +223,38 @@ def plot_edge(symbol: str, r: float = 0.045,
                 xy=(forward_cal_dates[-1], trend_at_exp),
                 xytext=(forward_cal_dates[-1], rf_at_exp),
                 arrowprops=dict(arrowstyle="<->", color="#E91E63", lw=2.5))
-    ax.annotate(f"  THE EDGE\n  {edge_pct:.0f}% unpriced drift",
+    ax.annotate(f"  EDGE: {edge_pct:.0f}%\n  drift = {drift_in_sigma:.1f}σ",
                 xy=(forward_cal_dates[-1], mid_y),
                 fontsize=11, fontweight="bold", color="#E91E63",
                 ha="left", va="center")
 
-    # --- Formatting ---
+    # --- Title with Lindy years ---
+    title_line1 = f"{ticker} — LEAPS Edge: Two Cones"
     title_line2 = (f"Slope={ann_slope*100:.1f}%/yr  R²={r2:.3f}  "
+                   f"Lindy={total_years:.0f}yr  "
                    f"IV={iv*100:.0f}%  DTE={dte}  K=${leaps['strike']:.0f}")
     if abs(deviation) > 1:
         title_line2 += f"  Spot {deviation:+.1f}% vs trend"
-    ax.set_title(f"{ticker} — LEAPS Edge Visualization\n{title_line2}",
-                 fontsize=14, fontweight="bold")
+    ax.set_title(f"{title_line1}\n{title_line2}",
+                 fontsize=13, fontweight="bold")
+
+    # --- Info box with key metrics ---
+    info_text = (
+        f"Lindy: {total_years:.0f}yr history, {ann_slope*100:.1f}%/yr, R²={r2:.3f}\n"
+        f"Green cone: resid σ = {resid_std_ann*100:.0f}%/yr (from R²)\n"
+        f"Red cone: IV = {iv*100:.0f}%/yr (from options market)\n"
+        f"Drift = {drift_in_sigma:.2f}σ above risk-neutral"
+    )
+    ax.text(0.98, 0.02, info_text, transform=ax.transAxes,
+            fontsize=9, fontfamily="monospace",
+            verticalalignment="bottom", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
+                      edgecolor="gray", alpha=0.85))
+
+    # --- Formatting ---
     ax.set_xlabel("Date")
     ax.set_ylabel("Price (log scale)")
-    ax.legend(loc="upper left", fontsize=10)
+    ax.legend(loc="upper left", fontsize=9)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     plt.xticks(rotation=45)
@@ -233,14 +276,16 @@ def plot_edge(symbol: str, r: float = 0.045,
     return {
         "ticker": ticker, "spot": spot, "trend_today": trend_today,
         "deviation_pct": deviation, "slope": ann_slope, "r2": r2,
+        "resid_std_ann": resid_std_ann,
+        "iv": iv, "drift_in_sigma": drift_in_sigma,
         "trend_at_exp": trend_at_exp, "rf_at_exp": rf_at_exp,
-        "edge_pct": edge_pct,
+        "edge_pct": edge_pct, "total_years": total_years,
     }
 
 
 def main():
     p = argparse.ArgumentParser(
-        description="Visualize the LEAPS edge: Lindy trend vs IV cone.",
+        description="Visualize the LEAPS edge: Lindy cone vs IV cone.",
         epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
